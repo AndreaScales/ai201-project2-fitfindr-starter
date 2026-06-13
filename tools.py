@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -20,6 +21,9 @@ from groq import Groq
 from utils.data_loader import load_listings
 
 load_dotenv()
+
+# Default Groq chat model. Swap here to change it everywhere.
+MODEL = "llama-3.3-70b-versatile"
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -32,6 +36,49 @@ def _get_groq_client():
             "GROQ_API_KEY not set. Add it to a .env file in the project root."
         )
     return Groq(api_key=api_key)
+
+
+def _chat(prompt: str, temperature: float = 0.7) -> str:
+    """
+    Send a single user prompt to the LLM and return the reply text.
+
+    Raises on client/API errors — callers are responsible for catching these
+    and returning a graceful fallback string (tools never raise).
+    """
+    client = _get_groq_client()
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _format_item(item: dict) -> str:
+    """
+    Render a listing dict or a wardrobe-item dict as a compact one-line
+    description for use inside an LLM prompt. Tolerates missing fields.
+    """
+    # Listings use 'title'; wardrobe items use 'name'.
+    label = item.get("title") or item.get("name") or "item"
+    parts = [label]
+
+    colors = item.get("colors")
+    if colors:
+        parts.append(f"colors: {', '.join(colors)}")
+
+    tags = item.get("style_tags")
+    if tags:
+        parts.append(f"style: {', '.join(tags)}")
+
+    if item.get("category"):
+        parts.append(f"category: {item['category']}")
+    if item.get("brand"):
+        parts.append(f"brand: {item['brand']}")
+    if item.get("notes"):
+        parts.append(f"notes: {item['notes']}")
+
+    return " — ".join(parts)
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
@@ -69,8 +116,46 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    # Tokenize the search keywords (lowercase, alphanumeric words only).
+    keywords = set(re.findall(r"[a-z0-9]+", description.lower()))
+
+    size_filter = size.lower() if size else None
+
+    scored: list[tuple[int, dict]] = []
+    for listing in listings:
+        # Step 2a: price ceiling (inclusive).
+        if max_price is not None and listing["price"] > max_price:
+            continue
+
+        # Step 2b: size filter (case-insensitive substring match, so
+        # "M" matches "S/M" and "m" matches "Medium").
+        if size_filter is not None and size_filter not in listing["size"].lower():
+            continue
+
+        # Step 3: score by keyword overlap across the listing's text fields.
+        haystack = " ".join(
+            [
+                listing["title"],
+                listing["description"],
+                listing["category"],
+                listing.get("brand") or "",
+                " ".join(listing["style_tags"]),
+                " ".join(listing["colors"]),
+            ]
+        ).lower()
+        listing_words = set(re.findall(r"[a-z0-9]+", haystack))
+        score = len(keywords & listing_words)
+
+        # Step 4: drop listings with no keyword overlap.
+        if score > 0:
+            scored.append((score, listing))
+
+    # Step 5: sort by score, highest first (stable sort preserves dataset order
+    # for ties), and return just the listing dicts.
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [listing for _, listing in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +185,46 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # Describe the thrifted item for the prompt (shared by both branches).
+    item_desc = _format_item(new_item)
+
+    items = (wardrobe or {}).get("items", [])
+
+    if not items:
+        # Step 2: empty wardrobe → general styling advice, no specific pieces.
+        prompt = (
+            "You are a thrift-fashion stylist. A shopper is considering this "
+            f"second-hand find:\n\n{item_desc}\n\n"
+            "They haven't told you what's already in their closet. Suggest how "
+            "to style this piece in general terms: what kinds of items pair "
+            "well with it, what occasions or vibe it suits, and 1–2 example "
+            "outfit ideas using common wardrobe staples. Keep it friendly and "
+            "concrete — about 3–5 sentences."
+        )
+    else:
+        # Step 3: populated wardrobe → outfits using specific named pieces.
+        wardrobe_lines = "\n".join(f"- {_format_item(it)}" for it in items)
+        prompt = (
+            "You are a thrift-fashion stylist. A shopper is considering this "
+            f"second-hand find:\n\n{item_desc}\n\n"
+            "Here is what they already own:\n"
+            f"{wardrobe_lines}\n\n"
+            "Suggest 1–2 complete outfits that pair the new find with specific "
+            "pieces from their wardrobe. Refer to the wardrobe pieces by name. "
+            "For each outfit, briefly explain why it works and what vibe it "
+            "gives. Keep it friendly and concrete."
+        )
+
+    # Step 4: call the LLM; never raise — fall back to advice the agent can use.
+    try:
+        return _chat(prompt, temperature=0.7)
+    except Exception as exc:  # noqa: BLE001 — tools surface errors as text
+        name = new_item.get("title") or new_item.get("name") or "this piece"
+        return (
+            f"Couldn't reach the styling assistant ({exc}). As a starting "
+            f"point, {name} is versatile — try pairing it with neutral basics "
+            "and one statement piece to build a balanced look."
+        )
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +256,43 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # Step 1: guard against an empty/whitespace outfit — return an error
+    # string, never raise (the agent decides what to do with it).
+    if not outfit or not outfit.strip():
+        return (
+            "Can't write a caption yet — no outfit suggestion was provided. "
+            "Run suggest_outfit() first, then pass its result here."
+        )
+
+    # Pull the details the caption should mention naturally (once each).
+    name = new_item.get("title") or new_item.get("name") or "this thrifted find"
+    price = new_item.get("price")
+    price_str = f"${price:g}" if isinstance(price, (int, float)) else "a steal"
+    platform = new_item.get("platform") or "secondhand"
+
+    # Step 2: build the prompt.
+    prompt = (
+        "Write a short, shareable Instagram/TikTok-style OOTD caption for a "
+        "thrifted find. Use this info:\n"
+        f"- Item: {name}\n"
+        f"- Price: {price_str}\n"
+        f"- Platform: {platform}\n"
+        f"- The outfit: {outfit}\n\n"
+        "Guidelines:\n"
+        "- 2–4 sentences, casual and authentic — like a real person posting "
+        "their fit, NOT a product description.\n"
+        f"- Mention the item name, the price ({price_str}), and the platform "
+        f"({platform}) naturally, once each.\n"
+        "- Capture the outfit's vibe in specific terms.\n"
+        "- Return only the caption text (emojis/hashtags welcome), nothing else."
+    )
+
+    # Step 3: call the LLM with higher temperature so captions vary. Never
+    # raise — fall back to a simple caption the agent can still use.
+    try:
+        return _chat(prompt, temperature=0.95)
+    except Exception as exc:  # noqa: BLE001 — tools surface errors as text
+        return (
+            f"(Caption generator unavailable: {exc}) Thrifted {name} for "
+            f"{price_str} on {platform} and styled it up — obsessed with this look. 🧵"
+        )
