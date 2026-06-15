@@ -83,7 +83,17 @@ If it fails (there are no items in wardrobe) or it returns nothing, then it will
 
 **How does your agent decide which tool to call next?**
 <!-- Describe the logic your planning loop uses. What does it look at? What conditions change its behavior? How does it know when it's done? -->
-The agent decides which tool to call next based off of the stored state. For example, if search_listing runs and it is empty, then it will tell the user what to run differently and it will 
+The agent decides which tool to call next based off of the stored session state. It runs as a fixed, ordered pipeline with one branch point, rather than free-form tool selection:
+
+1. **Parse the query** — `_parse_query()` extracts `description`, `size`, and `max_price` from the user's text (regex: `size M`, `under $30`/bare `$30`) and stores them in `session["parsed"]`.
+2. **Search** — calls `search_listings(description, size, max_price)` and stores the list in `session["search_results"]`.
+3. **Branch on the search result** — this is the key decision:
+   - If `search_results` is **empty**, the agent sets `session["error"]` to a helpful "no listings found / try a different filter" message and **returns immediately**. It does *not* call the LLM tools, because there is no item to style.
+   - If `search_results` has items, it picks the top (most relevant) one as `session["selected_item"]` and continues.
+4. **Suggest an outfit** — calls `suggest_outfit(selected_item, wardrobe)` and stores the result in `session["outfit_suggestion"]`.
+5. **Create a fit card** — calls `create_fit_card(outfit_suggestion, selected_item)` and stores it in `session["fit_card"]`.
+
+**How it knows it's done:** the loop is finished when it either returns early on the empty-search branch (error set, other outputs `None`) or reaches the end with all three output fields populated. The caller checks `session["error"]` first — if it's `None`, the run succeeded. The two LLM tools never raise (they return fallback strings on failure), so once search succeeds the pipeline always runs to completion.
 
 ---
 
@@ -91,6 +101,23 @@ The agent decides which tool to call next based off of the stored state. For exa
 
 **How does information from one tool get passed to the next?**
 <!-- Describe how your agent stores and accesses state within a session. What data is tracked? How is it passed between tool calls? -->
+
+All information for a single interaction lives in one **session dict**, created by `_new_session(query, wardrobe)` at the start of `run_agent()`. This dict is the single source of truth — every step reads what it needs from the session and writes its result back into the session, so no tool talks to another tool directly. Output of one tool becomes input to the next *through* the session.
+
+**What's tracked in the session:**
+
+| Key | Set by | Used by |
+|-----|--------|---------|
+| `query` | `_new_session` (original user text) | parsing |
+| `parsed` | Step 2 — `_parse_query()` → `{description, size, max_price}` | `search_listings` |
+| `search_results` | Step 3 — `search_listings()` output | branch check + item selection |
+| `selected_item` | Step 4 — top result (`search_results[0]`) | `suggest_outfit`, `create_fit_card` |
+| `wardrobe` | `_new_session` (passed in by the UI) | `suggest_outfit` |
+| `outfit_suggestion` | Step 5 — `suggest_outfit()` output | `create_fit_card` |
+| `fit_card` | Step 6 — `create_fit_card()` output | final UI output |
+| `error` | set only on the empty-search branch | UI (decides which panels to show) |
+
+**How it passes between tool calls:** for example, `search_listings` writes `search_results`; Step 4 reads that and writes `selected_item`; `suggest_outfit` reads `selected_item` (+ `wardrobe`) and writes `outfit_suggestion`; `create_fit_card` reads `outfit_suggestion` and `selected_item` and writes `fit_card`. The fully-populated session is then returned to the UI, which maps `selected_item`, `outfit_suggestion`, and `fit_card` to the three output panels — or, if `error` is set, shows the error in the first panel and leaves the other two blank. The session is per-interaction (a fresh one is built on every `run_agent()` call), so there is no shared state between separate queries.
 
 ---
 
@@ -117,29 +144,60 @@ For each tool, describe the specific failure mode you're handling and what the a
      sketch are all fine. You'll share this diagram with an AI tool when asking it to implement
      the planning loop and each individual tool. -->
 
-     User query
-    │
-    ▼
-Planning Loop ───────────────────────────────────────────┐
-    │                                                    │
-    ├─► search_listings(description, size, max_price)    │
-    │       │ results=[]                                 │
-    │       ├──► [ERROR] "No listings found..." → return │
-    │       │                                            │
-    │       │ results=[item, ...]                        │
-    │       ▼                                            │
-    │   Session: selected_item = results[0]              │
-    │       │                                            │
-    ├─► suggest_outfit(selected_item, wardrobe)          │
-    │       │                                            │
-    │   Session: outfit_suggestion = "..."               │
-    │       │                                            │
-    └─► create_fit_card(outfit_suggestion, selected_item)│
-            │                                            │
-        Session: fit_card = "..."                        │
-            │                                            └─ error path returns here
+UI LAYER (app.py)
+  User types query + picks wardrobe (Example / Empty)
+            │
             ▼
-        Return session
+  handle_query(user_query, wardrobe_choice)
+            │  calls run_agent(query, wardrobe)
+            ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ PLANNING LOOP (agent.py → run_agent)                                       │
+│                                                                            │
+│  Step 1: session = _new_session(query, wardrobe)   ──┐  reads/writes       │
+│                                                      │  every step         │
+│  Step 2: parse query → description, size, max_price  │                     │
+│          session["parsed"] = {...}                   ▼                     │
+│                                              ┌────────────────────────┐    │
+│  Step 3: search_listings(desc, size, price)  │  SESSION / STATE       │    │
+│          │                                   │  (single dict, the     │    │
+│          ├─ results == []  ──► set           │   source of truth)     │    │
+│          │   session["error"]                │                        │    │
+│          │   = "No listings found…"  ───────►│  query                 │    │
+│          │   RETURN early  ✗                 │  parsed                │    │
+│          │                                   │  search_results        │    │
+│          ▼ results = [item, …]               │  selected_item         │    │
+│  Step 4: session["selected_item"]            │  wardrobe              │    │
+│          = results[0]  ─────────────────────►│  outfit_suggestion     │    │
+│          │                                   │  fit_card              │    │
+│  Step 5: suggest_outfit(selected_item,       │  error                 │    │
+│          │              wardrobe)            └────────────────────────┘    │
+│          │   wardrobe empty → general advice  ▲         ▲                  │
+│          │   LLM error      → fallback string │         │                  │
+│          ▼   session["outfit_suggestion"] ────┘         │                  │
+│  Step 6: create_fit_card(outfit, selected_item)         │                  │
+│          │   empty outfit → error-string guard          │                  │
+│          │   LLM error    → fallback caption            │                  │
+│          ▼   session["fit_card"] ───────────────────────┘                  │
+│                                                                            │
+│  Step 7: RETURN session  ✓                                                 │
+└──────────────────────────────────────────────────────────────────────────┘
+            │
+            ▼
+  handle_query reads the session:
+    error set?  → show error in panel 1, blanks in panels 2 & 3
+    else        → map selected_item → 🛍️ Top listing
+                      outfit_suggestion → 👗 Outfit idea
+                      fit_card          → ✨ Fit card
+
+NOTES
+  • Tools never raise — they return [] / error-strings / fallback strings,
+    so the loop always finishes and the UI always gets three panels.
+  • search_listings is the only hard stop: empty results short-circuit the
+    loop before any LLM call (no point styling an item that wasn't found).
+  • suggest_outfit & create_fit_card call the Groq LLM
+    (llama-3.3-70b-versatile); both degrade gracefully on empty input or
+    API failure rather than crashing the agent.
 
 ---
 
